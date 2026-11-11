@@ -73,15 +73,24 @@ class Ledger:
             "issued",
             "due",
             "reference",
+            "recorded",
         }
-        obj(data, fields, fields - {"due"})
+        obj(data, fields, fields - {"due", "recorded"})
         ident = identifier(data["id"])
         kind = data["kind"]
-        if kind not in {"invoice", "payment", "credit"}:
-            error("input", "document kind must be invoice payment or credit")
+        if kind not in {"invoice", "payment", "credit", "writeoff"}:
+            error(
+                "input",
+                "document kind must be invoice payment credit or writeoff",
+            )
         code = currency(data["currency"])
         minor = money(data["amount"], code)
         issued = day(data["issued"])
+        # Knowledge date: when the fact became known. It cannot precede the
+        # business date and defaults to the business date when not supplied.
+        recorded = day(data["recorded"]) if data.get("recorded") else issued
+        if recorded < issued:
+            error("input", "knowledge date cannot precede issue date")
         due = data.get("due")
         if kind == "invoice":
             due = day(due)
@@ -105,6 +114,7 @@ class Ledger:
             "issued": issued,
             "due": due,
             "reference": reference.strip(),
+            "recorded": recorded,
         }
         with self.db.transaction() as con:
             self.party(payload["party"])
@@ -115,7 +125,7 @@ class Ledger:
                 return {"id": ident, "existing": True}
             self.check_period(issued)
             con.execute(
-                "INSERT INTO documents VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO documents VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     ident,
                     kind,
@@ -127,14 +137,19 @@ class Ledger:
                     payload["reference"],
                     canonical(payload),
                     digest(payload),
+                    recorded,
                 ),
             )
             if kind == "invoice":
                 postings = [("receivable", minor), ("revenue_control", -minor)]
             elif kind == "payment":
                 postings = [("cash", minor), ("unapplied", -minor)]
-            else:
+            elif kind == "credit":
                 postings = [("credit_control", minor), ("unapplied", -minor)]
+            else:
+                # A write-off memo is itself a non-cash source document; it only
+                # reduces receivables once allocated to invoices.
+                postings = [("writeoff_control", minor), ("unapplied", -minor)]
             self.entry(ident, ident, postings, issued, "document")
             self.db.audit("document_posted", ident, payload)
         return {"id": ident, "existing": False}
@@ -149,26 +164,43 @@ class Ledger:
                     (entry_id, document, account, value, effective, reason),
                 )
 
-    def active_at(self, document_id, cutoff):
+    def active_at(self, document_id, cutoff, knowledge_cutoff=None):
         document = self.document(document_id)
-        if document["issued"] > cutoff:
+        knowledge_cutoff = day(knowledge_cutoff or cutoff)
+        cutoff = day(cutoff)
+        if document["issued"] > cutoff or document["recorded"] > knowledge_cutoff:
             return False
         reversal = self.db.one(
-            "SELECT effective FROM document_reversals WHERE document=?", (document_id,)
+            "SELECT effective,recorded FROM document_reversals WHERE document=?",
+            (document_id,),
         )
-        return reversal is None or reversal["effective"] > cutoff
+        if reversal is None:
+            return True
+        if reversal["effective"] <= cutoff and reversal["recorded"] <= knowledge_cutoff:
+            return False
+        return True
 
-    def balance(self, document_id, cutoff="2200-12-31"):
+    def balance(
+        self, document_id, cutoff="2200-12-31", knowledge_cutoff="2200-12-31"
+    ):
         cutoff = day(cutoff)
+        knowledge_cutoff = day(knowledge_cutoff)
         document = self.document(document_id)
-        if not self.active_at(document_id, cutoff):
+        if not self.active_at(document_id, cutoff, knowledge_cutoff):
             return 0
         field = "invoice" if document["kind"] == "invoice" else "source"
         allocated = self.db.one(
-            "SELECT COALESCE(SUM(amount),0) AS n FROM allocations WHERE "
-            + field
-            + "=? AND effective<=? AND (reversed IS NULL OR reversed>?)",
-            (document_id, cutoff, cutoff),
+            "SELECT COALESCE(SUM(a.amount),0) AS n FROM allocations a "
+            "LEFT JOIN reversals r ON r.target=a.id AND r.kind='allocation' "
+            "WHERE a." + field + "=? AND a.effective<=? AND a.recorded<=? "
+            "AND (a.reversed IS NULL OR a.reversed>? OR r.recorded>?)",
+            (
+                document_id,
+                cutoff,
+                knowledge_cutoff,
+                cutoff,
+                knowledge_cutoff,
+            ),
         )["n"]
         return document["amount"] - allocated
 
@@ -180,18 +212,25 @@ class Ledger:
         amount,
         effective,
         reason="confirmed matching",
+        recorded=None,
     ):
         identifier(allocation_id)
         effective = day(effective)
+        recorded = day(recorded) if recorded else effective
+        if recorded < effective:
+            error("input", "knowledge date cannot precede allocation date")
         with self.db.transaction() as con:
             credit = self.document(source)
             debit = self.document(invoice)
             minor = money(amount, credit["currency"])
             if (
-                credit["kind"] not in {"payment", "credit"}
+                credit["kind"] not in {"payment", "credit", "writeoff"}
                 or debit["kind"] != "invoice"
             ):
-                error("allocation", "allocation requires payment or credit and invoice")
+                error(
+                    "allocation",
+                    "allocation requires payment credit or writeoff and invoice",
+                )
             if (credit["party"], credit["currency"]) != (
                 debit["party"],
                 debit["currency"],
@@ -209,7 +248,8 @@ class Ledger:
                     existing["amount"],
                     existing["effective"],
                     existing["reason"],
-                ) != (source, invoice, minor, effective, reason):
+                    existing["recorded"],
+                ) != (source, invoice, minor, effective, reason, recorded):
                     error("conflict", "allocation identity differs")
                 return {"id": allocation_id, "existing": True}
             self.check_period(effective)
@@ -223,8 +263,8 @@ class Ledger:
             ):
                 error("allocation", "allocation exceeds available balance")
             con.execute(
-                "INSERT INTO allocations VALUES(?,?,?,?,?,NULL,?)",
-                (allocation_id, source, invoice, minor, effective, reason),
+                "INSERT INTO allocations VALUES(?,?,?,?,?,NULL,?,?)",
+                (allocation_id, source, invoice, minor, effective, reason, recorded),
             )
             self.entry(
                 allocation_id,
@@ -241,23 +281,35 @@ class Ledger:
                     "invoice": invoice,
                     "amount": minor,
                     "effective": effective,
+                    "recorded": recorded,
                 },
             )
         return {"id": allocation_id, "existing": False}
 
-    def reverse_allocation(self, reversal_id, allocation_id, effective, reason):
+    def reverse_allocation(
+        self,
+        reversal_id,
+        allocation_id,
+        effective,
+        reason,
+        recorded=None,
+    ):
         identifier(reversal_id)
         effective = day(effective)
+        recorded = day(recorded) if recorded else effective
+        if recorded < effective:
+            error("input", "knowledge date cannot precede reversal date")
         if not isinstance(reason, str) or not reason.strip():
             error("input", "reversal requires reason")
         with self.db.transaction() as con:
             old = self.db.one("SELECT * FROM reversals WHERE id=?", (reversal_id,))
             if old:
-                if (old["target"], old["kind"], old["effective"], old["reason"]) != (
+                if (old["target"], old["kind"], old["effective"], old["reason"], old["recorded"]) != (
                     allocation_id,
                     "allocation",
                     effective,
                     reason,
+                    recorded,
                 ):
                     error("conflict", "reversal identity differs")
                 return {"id": reversal_id, "existing": True}
@@ -277,8 +329,8 @@ class Ledger:
                 (effective, allocation_id),
             )
             con.execute(
-                "INSERT INTO reversals VALUES(?,?,?,?,?)",
-                (reversal_id, allocation_id, "allocation", effective, reason),
+                "INSERT INTO reversals VALUES(?,?,?,?,?,?)",
+                (reversal_id, allocation_id, "allocation", effective, reason, recorded),
             )
             self.entry(
                 reversal_id,
@@ -293,24 +345,40 @@ class Ledger:
             self.db.audit(
                 "allocation_reversed",
                 reversal_id,
-                {"allocation": allocation_id, "effective": effective, "reason": reason},
+                {
+                    "allocation": allocation_id,
+                    "effective": effective,
+                    "recorded": recorded,
+                    "reason": reason,
+                },
             )
         return {"id": reversal_id, "existing": False}
 
-    def reverse_document(self, reversal_id, document_id, effective, reason):
+    def reverse_document(
+        self,
+        reversal_id,
+        document_id,
+        effective,
+        reason,
+        recorded=None,
+    ):
         identifier(reversal_id)
         effective = day(effective)
+        recorded = day(recorded) if recorded else effective
+        if recorded < effective:
+            error("input", "knowledge date cannot precede reversal date")
         if not isinstance(reason, str) or not reason.strip():
             error("input", "document reversal requires reason")
         with self.db.transaction() as con:
             document = self.document(document_id)
             old = self.db.one("SELECT * FROM reversals WHERE id=?", (reversal_id,))
             if old:
-                if (old["target"], old["kind"], old["effective"], old["reason"]) != (
+                if (old["target"], old["kind"], old["effective"], old["reason"], old["recorded"]) != (
                     document_id,
                     "document",
                     effective,
                     reason,
+                    recorded,
                 ):
                     error("conflict", "reversal identity differs")
                 return {"id": reversal_id, "existing": True}
@@ -333,12 +401,12 @@ class Ledger:
             ):
                 error("state", "unlink bank evidence before payment reversal")
             con.execute(
-                "INSERT INTO reversals VALUES(?,?,?,?,?)",
-                (reversal_id, document_id, "document", effective, reason),
+                "INSERT INTO reversals VALUES(?,?,?,?,?,?)",
+                (reversal_id, document_id, "document", effective, reason, recorded),
             )
             con.execute(
-                "INSERT INTO document_reversals VALUES(?,?,?)",
-                (document_id, effective, reversal_id),
+                "INSERT INTO document_reversals VALUES(?,?,?,?)",
+                (document_id, effective, reversal_id, recorded),
             )
             original = self.db.rows(
                 "SELECT account,amount FROM postings WHERE entry=? AND reason='document'",
@@ -354,7 +422,12 @@ class Ledger:
             self.db.audit(
                 "document_reversed",
                 reversal_id,
-                {"document": document_id, "effective": effective, "reason": reason},
+                {
+                    "document": document_id,
+                    "effective": effective,
+                    "recorded": recorded,
+                    "reason": reason,
+                },
             )
         return {"id": reversal_id, "existing": False}
 

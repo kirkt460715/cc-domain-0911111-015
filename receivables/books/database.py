@@ -4,17 +4,22 @@ from contextlib import contextmanager
 from pathlib import Path
 from ..primitives import canonical, digest, decode, error
 
+SCHEMA_VERSION = "2"
+
 DDL = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS parties(id TEXT PRIMARY KEY,name TEXT NOT NULL,aliases TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS documents(id TEXT PRIMARY KEY,kind TEXT NOT NULL,party TEXT NOT NULL,currency TEXT NOT NULL,
- amount INTEGER NOT NULL,issued TEXT NOT NULL,due TEXT,reference TEXT NOT NULL,payload TEXT NOT NULL,digest TEXT NOT NULL);
+ amount INTEGER NOT NULL,issued TEXT NOT NULL,due TEXT,reference TEXT NOT NULL,payload TEXT NOT NULL,digest TEXT NOT NULL,
+ recorded TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS postings(sequence INTEGER PRIMARY KEY AUTOINCREMENT,entry TEXT NOT NULL,document TEXT NOT NULL,
  account TEXT NOT NULL,amount INTEGER NOT NULL,effective TEXT NOT NULL,reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS allocations(id TEXT PRIMARY KEY,source TEXT NOT NULL,invoice TEXT NOT NULL,amount INTEGER NOT NULL,
- effective TEXT NOT NULL,reversed TEXT,reason TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS reversals(id TEXT PRIMARY KEY,target TEXT NOT NULL,kind TEXT NOT NULL,effective TEXT NOT NULL,reason TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS document_reversals(document TEXT PRIMARY KEY,effective TEXT NOT NULL,reversal TEXT NOT NULL);
+ effective TEXT NOT NULL,reversed TEXT,reason TEXT NOT NULL,recorded TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS reversals(id TEXT PRIMARY KEY,target TEXT NOT NULL,kind TEXT NOT NULL,effective TEXT NOT NULL,
+ reason TEXT NOT NULL,recorded TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS document_reversals(document TEXT PRIMARY KEY,effective TEXT NOT NULL,reversal TEXT NOT NULL,
+ recorded TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS batches(id TEXT PRIMARY KEY,digest TEXT NOT NULL,result TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS bank_lines(id TEXT PRIMARY KEY,account TEXT NOT NULL,currency TEXT NOT NULL,amount INTEGER NOT NULL,
  booked TEXT NOT NULL,reference TEXT NOT NULL,payer TEXT NOT NULL,payload TEXT NOT NULL,digest TEXT NOT NULL);
@@ -22,11 +27,29 @@ CREATE TABLE IF NOT EXISTS bank_links(line TEXT PRIMARY KEY,payment TEXT NOT NUL
 CREATE TABLE IF NOT EXISTS statements(id TEXT PRIMARY KEY,payload TEXT NOT NULL,digest TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY,payload TEXT NOT NULL,digest TEXT NOT NULL,state TEXT NOT NULL,result TEXT);
 CREATE TABLE IF NOT EXISTS disputes(id TEXT PRIMARY KEY,invoice TEXT NOT NULL,amount INTEGER NOT NULL,opened TEXT NOT NULL,
- closed TEXT,reason TEXT NOT NULL,revision INTEGER NOT NULL);
+ closed TEXT,reason TEXT NOT NULL,revision INTEGER NOT NULL,opened_recorded TEXT NOT NULL,closed_recorded TEXT);
 CREATE TABLE IF NOT EXISTS periods(id TEXT PRIMARY KEY,start TEXT NOT NULL,end TEXT NOT NULL,state TEXT NOT NULL,digest TEXT);
+CREATE TABLE IF NOT EXISTS vintages(id TEXT NOT NULL,version INTEGER NOT NULL,payload TEXT NOT NULL,digest TEXT NOT NULL,
+ business_cutoff TEXT NOT NULL,knowledge_cutoff TEXT NOT NULL,PRIMARY KEY(id,version));
 CREATE TABLE IF NOT EXISTS audit(sequence INTEGER PRIMARY KEY AUTOINCREMENT,kind TEXT NOT NULL,entity TEXT NOT NULL,
  payload TEXT NOT NULL,previous TEXT NOT NULL,digest TEXT NOT NULL);
 """
+
+# Bitemporal columns added in schema v2. Each row carries the date on which the
+# fact became known ("recorded") in addition to its business-effective date.
+MIGRATION_V2 = [
+    "ALTER TABLE documents ADD COLUMN recorded TEXT NOT NULL DEFAULT ''",
+    "UPDATE documents SET recorded=issued WHERE recorded=''",
+    "ALTER TABLE allocations ADD COLUMN recorded TEXT NOT NULL DEFAULT ''",
+    "UPDATE allocations SET recorded=effective WHERE recorded=''",
+    "ALTER TABLE reversals ADD COLUMN recorded TEXT NOT NULL DEFAULT ''",
+    "UPDATE reversals SET recorded=effective WHERE recorded=''",
+    "ALTER TABLE document_reversals ADD COLUMN recorded TEXT NOT NULL DEFAULT ''",
+    "UPDATE document_reversals SET recorded=effective WHERE recorded=''",
+    "ALTER TABLE disputes ADD COLUMN opened_recorded TEXT NOT NULL DEFAULT ''",
+    "UPDATE disputes SET opened_recorded=opened WHERE opened_recorded=''",
+    "ALTER TABLE disputes ADD COLUMN closed_recorded TEXT",
+]
 
 
 class Database:
@@ -43,9 +66,20 @@ class Database:
         self.lock = threading.RLock()
         self.depth = 0
         old = self.one("SELECT value FROM meta WHERE key='version'")
-        if old and old["value"] != "1":
+        version = old["value"] if old else None
+        if version is not None and version not in {"1", SCHEMA_VERSION}:
             error("schema", "unsupported ledger schema")
-        self.connection.execute("INSERT OR IGNORE INTO meta VALUES('version','1')")
+        if version == "1":
+            # Existing rows become "known on their business date"; new rows keep
+            # an explicit knowledge date supplied by the caller.
+            for statement in MIGRATION_V2:
+                self.connection.execute(statement)
+            self.connection.execute(
+                "UPDATE meta SET value=? WHERE key='version'", (SCHEMA_VERSION,)
+            )
+        self.connection.execute(
+            "INSERT OR IGNORE INTO meta VALUES('version',?)", (SCHEMA_VERSION,)
+        )
 
     @contextmanager
     def transaction(self):

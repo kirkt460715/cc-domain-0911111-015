@@ -17,8 +17,8 @@ class Matcher:
     def candidates(self, source, effective):
         effective = day(effective)
         payment = self.ledger.document(source)
-        if payment["kind"] not in {"payment", "credit"}:
-            error("matching", "matching source must be payment or credit")
+        if payment["kind"] not in {"payment", "credit", "writeoff"}:
+            error("matching", "matching source must be payment credit or writeoff")
         available = self.ledger.available_from(source, effective)
         candidates = []
         for invoice in self.db.rows(

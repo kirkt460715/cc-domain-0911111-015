@@ -12,9 +12,12 @@ class Disputes:
             error("missing", "dispute not found")
         return row
 
-    def open(self, dispute_id, invoice, amount, opened, reason):
+    def open(self, dispute_id, invoice, amount, opened, reason, recorded=None):
         identifier(dispute_id)
         opened = day(opened)
+        recorded = day(recorded) if recorded else opened
+        if recorded < opened:
+            error("input", "knowledge date cannot precede dispute open date")
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
             error("input", "bounded dispute reason required")
         with self.db.transaction() as con:
@@ -24,11 +27,12 @@ class Disputes:
             minor = money(amount, document["currency"])
             old = self.db.one("SELECT * FROM disputes WHERE id=?", (dispute_id,))
             if old:
-                if (old["invoice"], old["amount"], old["opened"], old["reason"]) != (
+                if (old["invoice"], old["amount"], old["opened"], old["reason"], old["opened_recorded"]) != (
                     invoice,
                     minor,
                     opened,
                     reason,
+                    recorded,
                 ):
                     error("conflict", "dispute identity differs")
                 return old
@@ -52,8 +56,8 @@ class Disputes:
                         "dispute", "disputed principal exceeds invoice original amount"
                     )
             con.execute(
-                "INSERT INTO disputes VALUES(?,?,?,?,NULL,?,1)",
-                (dispute_id, invoice, minor, opened, reason),
+                "INSERT INTO disputes VALUES(?,?,?,?,?,?,?,?,?)",
+                (dispute_id, invoice, minor, opened, None, reason, 1, recorded, None),
             )
             self.db.audit(
                 "dispute_opened",
@@ -62,13 +66,24 @@ class Disputes:
                     "invoice": invoice,
                     "amount": minor,
                     "opened": opened,
+                    "recorded": recorded,
                     "reason": reason,
                 },
             )
         return self.get(dispute_id)
 
-    def close(self, dispute_id, closed, expected_revision, reason):
+    def close(
+        self,
+        dispute_id,
+        closed,
+        expected_revision,
+        reason,
+        recorded=None,
+    ):
         closed = day(closed)
+        recorded = day(recorded) if recorded else closed
+        if recorded < closed:
+            error("input", "knowledge date cannot precede dispute close date")
         integer(expected_revision, 1)
         if not isinstance(reason, str) or not reason.strip():
             error("input", "resolution reason required")
@@ -80,22 +95,31 @@ class Disputes:
                 error("state", "dispute already closed or resolution predates opening")
             self.ledger.check_period(closed)
             con.execute(
-                "UPDATE disputes SET closed=?,revision=revision+1 WHERE id=?",
-                (closed, dispute_id),
+                "UPDATE disputes SET closed=?,revision=revision+1,closed_recorded=? WHERE id=?",
+                (closed, recorded, dispute_id),
             )
             self.db.audit(
                 "dispute_closed",
                 dispute_id,
-                {"closed": closed, "reason": reason, "revision": expected_revision + 1},
+                {
+                    "closed": closed,
+                    "recorded": recorded,
+                    "reason": reason,
+                    "revision": expected_revision + 1,
+                },
             )
         return self.get(dispute_id)
 
-    def list(self, cutoff, party=None):
+    def list(self, cutoff, party=None, knowledge_cutoff=None):
         cutoff = day(cutoff)
+        knowledge_cutoff = day(knowledge_cutoff or cutoff)
         if party is not None:
             self.ledger.party(party)
         rows = self.db.rows(
-            "SELECT d.*,i.party,i.currency FROM disputes d JOIN documents i ON i.id=d.invoice WHERE d.opened<=? AND (d.closed IS NULL OR d.closed>?) ORDER BY d.opened,d.id",
-            (cutoff, cutoff),
+            "SELECT d.*,i.party,i.currency FROM disputes d JOIN documents i ON i.id=d.invoice "
+            "WHERE d.opened<=? AND d.opened_recorded<=? "
+            "AND (d.closed IS NULL OR d.closed>? OR d.closed_recorded>?) "
+            "ORDER BY d.opened,d.id",
+            (cutoff, knowledge_cutoff, cutoff, knowledge_cutoff),
         )
         return [row for row in rows if party is None or row["party"] == party]

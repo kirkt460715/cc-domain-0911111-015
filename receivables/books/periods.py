@@ -40,7 +40,9 @@ class Periods:
         cutoff = (date.fromisoformat(row["end"]) - timedelta(days=1)).isoformat()
         postings = self.controls.journal(row["start"], row["end"])
         disputes = self.db.rows(
-            "SELECT * FROM disputes WHERE opened<? ORDER BY id", (row["end"],)
+            "SELECT id,invoice,amount,opened,closed,reason,revision FROM disputes "
+            "WHERE opened<? ORDER BY id",
+            (row["end"],),
         )
         # Future resolutions do not change evidence at the closed cutoff.
         for dispute in disputes:

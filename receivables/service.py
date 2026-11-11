@@ -16,6 +16,7 @@ from .matching.subsets import SubsetMatcher
 from .reporting.confirmation import Confirmations
 from .reporting.delivery import JournalDelivery
 from .reporting.trace import Trace
+from .reporting.vintages import Vintages
 
 
 class Workbench:
@@ -37,6 +38,7 @@ class Workbench:
         self.confirmations = Confirmations(self.db, self.ledger, self.aging)
         self.delivery = JournalDelivery(self.db)
         self.trace = Trace(self.db, self.ledger)
+        self.vintages = Vintages(self.db, self.ledger)
 
     def close(self):
         self.db.close()
@@ -94,6 +96,14 @@ class Workbench:
             "queue.exposure": self.queue.exposure,
             "queue.forecast": self.queue.forecast,
             "queue.exceptions": self.queue.exceptions,
+            "vintage.build": self.vintages.build,
+            "vintage.freeze": self.vintages.freeze,
+            "vintage.get": self.vintages.get,
+            "vintage.list": self.vintages.list,
+            "vintage.compare": self.vintages.compare,
+            "vintage.trace": self.vintages.trace_invoice,
+            "vintage.export": self.vintages.export,
+            "vintage.verify": self.vintages.verify,
         }
         for prefix, component, methods in [
             ("trace", self.trace, ["document", "provenance", "allocation_graph", "audit_page"]),
